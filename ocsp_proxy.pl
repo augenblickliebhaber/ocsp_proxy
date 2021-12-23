@@ -1,15 +1,12 @@
 #!/usr/bin/perl
 #
-# vim: set ts=2 sw=2 sts=2 et:
-#
-# ocsp proxy
-#
-# author, (c) Philippe Kueck <projects at unixadm dot org>
-#
-# license: lgpl
+# fork from ocsp_proxy
+# from author, (c) Philippe Kueck <projects at unixadm dot org>
 
 use strict;
 use warnings;
+
+use Math::BigInt;
 
 use HTTP::Daemon;
 use HTTP::Status;
@@ -26,17 +23,15 @@ use Pod::Usage;
 use POSIX;
 
 use threads;
-use threads::shared;
+use Thread::Queue;
 
 select(STDERR); $|++;
 select(STDOUT); $|++;
 
-my $mutex :shared;
-
 my $config = {
-    'host' => 'localhost',
+    'host' => '127.0.0.1',
     'port' => 8888,
-    'redis_sock' => '/run/redis/redis.sock',
+    'redis_sock' => '/run/redis/redis-server.sock',
     'rprefix' => 'ocspxy_'
 };
 
@@ -95,23 +90,21 @@ Extensions ::= SEQUENCE OF Extension
        critical  BOOLEAN OPTIONAL,
        extnValue OCTET STRING
     }
->;
 
-sub debug {
-  return unless $config->{'verbose'};
-  my $fmt = shift; printf STDERR "[debug] $fmt\n", @_
-}
-sub info { my $fmt = shift; printf "[info] $fmt\n", @_ }
-sub warning { my $fmt = shift; printf STDERR "[warn] $fmt\n", @_ }
-sub error { my $fmt = shift; printf STDERR "[error] $fmt\n", @_ }
-sub bailout { error(@_); exit 1 }
-
-sub update_cache {
-  my $cr = $_[0];
-
-  ### asn.1 decoder ###
-  my $asn = new Convert::ASN1;
-  my $asn_ret = $asn->prepare($asn_common . q<
+  OCSPRequest ::= SEQUENCE {
+    tbsRequest TBSRequest
+  --  optionalSignature [0] EXPLICIT ANY OPTIONAL
+  }
+  TBSRequest ::= SEQUENCE {
+    version [0] EXPLICIT Version OPTIONAL,
+    requestList SEQUENCE OF Request,
+    requestExtensions [2] EXPLICIT Extensions OPTIONAL
+  }
+  Request ::= SEQUENCE {
+    reqCert CertID,
+    singleRequestExtensions [0] EXPLICIT Extensions OPTIONAL
+  }
+  
 OCSPResponse ::= SEQUENCE {
     responseStatus     OCSPResponseStatus,
     responseBytes  [0] EXPLICIT ResponseBytes OPTIONAL
@@ -187,20 +180,76 @@ BasicOCSPResponse ::= SEQUENCE {
                 }
 
             UnknownInfo ::= NULL
-  >);
-  bailout("asn1 definition preparation failed: %s", $asn->error()) unless $asn_ret;
+
+
+>;
+
+### asn.1 decoder/encoder ###
+my $asn = new Convert::ASN1;
+my $asn_ret = $asn->prepare($asn_common);
+bailout("asn1 definition preparation failed: %s", $asn->error()) unless $asn_ret;
+
+### redis connection ###
+bailout("redis socket does not exist or is not readable") unless -r $config->{'redis_sock'};
+info("trying to connect to redis (timeout 60s)");
+my $redis;
+eval {
+  $redis = new Redis(
+    'sock' => $config->{'redis_sock'},
+    'reconnect' => 60, 'every' => 1_000_000
+  )
+};
+bailout("cannot connect to redis: %s", $@) if $@;
+info("connected to redis on %s", $config->{'redis_sock'});
+        
+sub debug {
+  return unless $config->{'verbose'};
+  my $fmt = shift; printf STDERR threads->tid()." [debug] $fmt\n", @_
+}
+sub info { my $fmt = shift; printf threads->tid()." [info ] $fmt\n", @_ }
+sub warning { my $fmt = shift; printf STDERR threads->tid()." [warn ] $fmt\n", @_ }
+sub error { my $fmt = shift; printf STDERR threads->tid()." [error] $fmt\n", @_ }
+sub bailout { error(@_); exit 1 }
+
+### Queue with cache records for update and delete redis db
+### and thread which doing this
+my $redisQueue = Thread::Queue->new();
+my @threads;
+push @threads, threads->create(\&update_redis_record);
+sub update_redis_record {
+  debug("start thread update_redis_record");
+  while (my $cache_ref = $redisQueue->dequeue()) {
+    if ($cache_ref->{'delete'}) {
+      eval {$redis->del($cache_ref->{'cache_key'})};
+      if ($@) {error("delete redis record %s failed: %s", $cache_ref->{'cache_key'}, $@); next}
+      info("redis record %s deleted", $cache_ref->{'cache_key'});
+    } else {
+      eval {$redis->hmset($cache_ref->{'cache_key'}, %$cache_ref)};
+      if ($@) {error("update redis record %s failed: %s", $cache_ref->{'cache_key'}, $@); next}
+      info("redis record %s updated", $cache_ref->{'cache_key'});
+    }
+  }
+  debug("exit thread update_redis_record");  
+}
+
+sub update_cache {
+  my $cr = $_[0];
+
   my $asn_top = $asn->find("OCSPResponse");
   bailout("asn1 cannot find top of structure: %s", $asn->error()) unless $asn_top;
 
   my $ua = new LWP::UserAgent('agent' => "ocsp_proxy");
-  my $proxy_req = new HTTP::Request('POST' => "http://".$cr->{'ocsp_responder'});
+
+  my $req_uri = "http://" . $cr->{'ocsp_responder'};
+
+  my $proxy_req = new HTTP::Request('POST' => $req_uri);
   $proxy_req->header(
     'Host' => $cr->{'ocsp_responder'},
     'Content-Type' => 'application/ocsp-request',
     'Content-Length' => length($cr->{'request'})
   );
   $proxy_req->content($cr->{'request'});
-  debug("forwarding ocsp request to %s", $cr->{'ocsp_responder'});
+  debug("forwarding ocsp request to %s", $req_uri);
   my $proxy_res = $ua->request($proxy_req);
 
   unless ($proxy_res->code == 200 &&
@@ -247,49 +296,44 @@ BasicOCSPResponse ::= SEQUENCE {
 }
 
 sub refresh_cache {
-  debug("refresh_cache");
-  my $redis;
-  eval {
-    $redis = new Redis(
-      'sock' => $config->{'redis_sock'},
-      'reconnect' => 60, 'every' => 1_000_000
-    )
-  };
-  if ($@) {error("refresh/redis: %s", $@); return}
+  for (;;) {
 
-  my %cache;
-  my @keys;
-  eval {@keys = $redis->keys($config->{'rprefix'}."*")};
-  if ($@) {error("refresh_cache: cannot connect to redis: %s", $@); return}
-  foreach my $cache_key (@keys) {
-    lock $mutex;
-    eval {%cache = $redis->hgetall($cache_key)};
-    if ($@) {error("refresh/redis: %s", $@); return}
-    unless ($cache{'ocsp_responder'} && $cache{'request'}) {
-      error("removing crippled cache entry %s", $cache_key);
-      eval {$redis->del($cache_key)};
+    debug("starting refresh_cache");
+
+    my %cache;
+    my @keys;
+    eval {@keys = $redis->keys($config->{'rprefix'}."*")};
+    if ($@) {error("refresh_cache: cannot connect to redis: %s", $@); return}
+    foreach my $cache_key (@keys) {
+      eval {%cache = $redis->hgetall($cache_key)};
       if ($@) {error("refresh/redis: %s", $@); return}
-      next
-    }
+      unless ($cache{'ocsp_responder'} && $cache{'request'}) {
+        error("removing crippled cache entry %s", $cache_key);
+        $cache{'delete'} = 1;
+        $redisQueue->enqueue(\%cache);
+        next
+      }
 
-    $cache{'nextupd'} ||= 0;
-    $cache{'thisupd'} ||= 0;
-    $cache{'lastchecked'} ||= 0;
-    my $intvl = (($cache{'nextupd'}-$cache{'thisupd'})/2+$cache{'thisupd'} > time)?86400:3600;
+      $cache{'nextupd'} ||= 0;
+      $cache{'thisupd'} ||= 0;
+      $cache{'lastchecked'} ||= 0;
+      my $intvl = (($cache{'nextupd'}-$cache{'thisupd'})/2+$cache{'thisupd'} > time)?86400:3600;
 
-    if ($cache{'lastchecked'}+$intvl < time) {
-      info("refreshing %s", $cache_key);
-      if (update_cache(\%cache)) {
-        eval {$redis->hmset($cache_key, %cache)};
-        if ($@) {error("refresh/redis: %s", $@); return}
-      } else {
-          error("refreshing %s failed", $cache_key)
+      if ($cache{'lastchecked'}+$intvl < time) {
+        info("refreshing %s", $cache_key);
+        if (update_cache(\%cache)) {
+          $redisQueue->enqueue(\%cache);
+        } else {
+            error("refreshing %s failed", $cache_key)
+        }
       }
     }
-  }
-  debug("leaving refresh_cache");
-}
 
+    debug("leaving refresh_cache and sleep for 30 min.");
+    sleep 1800;
+  }
+}
+  
 ### command line switches ###
 Getopt::Long::Configure("no_ignore_case");
 GetOptions(
@@ -301,167 +345,139 @@ GetOptions(
     'h|help' => sub {pod2usage({'-exitval' => 3, '-verbose' => 2})}
 ) or pod2usage({'-exitval' => 3, '-verbose' => 0});
 
-$0 = "ocsp_proxy" unless $config->{'verbose'};
-my @threads;
-push @threads, new threads(sub{
-    for (;;) {
-      refresh_cache();
-      sleep 1800
-    }
-});
+#$0 = "ocsp_proxy" unless $config->{'verbose'};
+$0 = "ocsp_proxy";
 
-push @threads, new threads(sub{&main()});
+push @threads, threads->create(\&refresh_cache);
+push @threads, threads->create(\&main);
 $_->join foreach @threads;
 
 sub main {
-  ### asn.1 decoder ###
-  my $asn = new Convert::ASN1;
-  my $asn_ret = $asn->prepare($asn_common . q<
-
-  OCSPRequest ::= SEQUENCE {
-    tbsRequest TBSRequest
---    optionalSignature [0] EXPLICIT ANY OPTIONAL
-  }
-  TBSRequest ::= SEQUENCE {
-    version [0] EXPLICIT Version OPTIONAL,
-    requestList SEQUENCE OF Request,
-    requestExtensions [2] EXPLICIT Extensions OPTIONAL
-  }
-  Request ::= SEQUENCE {
-    reqCert CertID,
-    singleRequestExtensions [0] EXPLICIT Extensions OPTIONAL
-  }>);
-  bailout("asn1 definition preparation failed: %s", $asn->error()) unless $asn_ret;
-  my $asn_top = $asn->find("OCSPRequest");
-  bailout("asn1 cannot find top of structure: %s", $asn->error()) unless $asn_top;
-
-  ### redis connection ###
-  bailout("redis socket does not exist or is not readable")
-    unless -r $config->{'redis_sock'};
-  info("trying to connect to redis (timeout 60s)");
-  my $redis;
-  eval {
-    $redis = new Redis(
-      'sock' => $config->{'redis_sock'},
-      'reconnect' => 60, 'every' => 1_000_000
-    )
-  };
-  bailout("cannot connect to redis: %s", $@) if $@;
-  info("connected to redis on %s", $config->{'redis_sock'});
-
   ### http daemon ###
   my $daemon = new HTTP::Daemon(
       'LocalAddr' => $config->{'host'},
       'LocalPort' => $config->{'port'},
-      'Reuse' => 1
+      'Listen' => 5
+#      'Reuse' => 1
   ) or bailout("failed starting HTTP::Daemon");
   info("listening on %s:%d", $config->{'host'}, $config->{'port'});
 
   ### main loop ###
-  while (my $c = $daemon->accept) {
-    info("connection from %s:%d", $c->peerhost, $c->peerport);
-    REQ: while (my $r = $c->get_request) {
-
-      unless ($r->method eq 'POST') {
-        warning("method is not POST");
-        $c->send_error(RC_FORBIDDEN);
-        next
-      }
-
-      unless ($r->header('Host') || $r->header('X-prune-from-cache')) {
-        warning("no 'Host' header found");
-        $c->send_error(RC_BAD_REQUEST);
-        next
-      }
-
-      unless ($r->header('Content-Type') eq "application/ocsp-request") {
-        warning("Content-Type is not 'application/ocsp-request'");
-        $c->send_error(RC_BAD_REQUEST);
-        next
-      }
-
-      my $ocsp_req = $asn_top->decode($r->content);
-
-      unless ($ocsp_req) {
-        warning("cannot parse ocsp request");
-        $c->send_error(RC_BAD_REQUEST);
-        next
-      }
-
-      if (scalar @{$ocsp_req->{'tbsRequest'}->{'requestList'}} > 1) {
-        warning("multiple requests detected -> pass through");
-        my $ua = new LWP::UserAgent('agent' => "ocsp_proxy");
-        my $proxy_req = new HTTP::Request('POST' => "http://".$r->header('Host'));
-        $proxy_req->header(%{$r->headers});
-        $proxy_req->content($r->content);
-        debug("forwarding ocsp request to %s", $r->header('Host'));
-        my $proxy_res = $ua->request($proxy_req);
-        my $client_res = new HTTP::Response($proxy_res->code);
-        $client_res->header(%{$proxy_res->headers});
-        $client_res->content($proxy_res->content);
-        $c->send_response($client_res);
-        next
-      }
-
-      my $cache_key = $config->{'rprefix'} . unpack("H*",
-        $ocsp_req->{'tbsRequest'}->{'requestList'}->[0]->{'reqCert'}->{'issuerKeyHash'}
-        ) .
-        $ocsp_req->{'tbsRequest'}->{'requestList'}->[0]->{'reqCert'}->{'serialNumber'}->as_hex;
-      debug("cache key is %s", $cache_key);
-
-      if ($r->header('X-prune-from-cache')) {
-        info("removing %s from cache", $cache_key);
-        eval { $redis->del($cache_key) };
-        bailout("redis connection failed: %s", $@) if $@;
-        $c->send_error(RC_GONE);
-        next
-      }
-
-      my %cache;
-      {
-        lock $mutex;
-        eval { %cache = $redis->hgetall($cache_key) };
-        bailout("redis connection failed: %s", $@) if $@;
-
-        unless (%cache && ($cache{'nextupd'} or 0) > time && \
-          ($cache{'thisupd'} or 0) > 0 && $cache{'request'} && $cache{'response'}) {
-          debug("cache needs update");
-          %cache = ('ocsp_responder' => $r->header('Host'), 'request' => $r->content);
-          if (update_cache(\%cache)) {
-            unless ($cache{'nonce'}) {
-              eval {$redis->hmset($cache_key, %cache)};
-              bailout("redis connection failed: %s", $@) if $@
-            } else {
-              warning("responder answered with a nonce, cannot cache those")
-            }
-          } else {
-            error("cache is invalid and cannot get valid data from ocsp responder");
-            eval {$redis->del($cache_key)};
-            bailout("redis connection failed: %s", $@) if $@;
-            $c->send_error(RC_SERVICE_UNAVAILABLE);
-            next REQ
-          }
-        }
-      }
-
-      debug("sending response");
-      my $client_res = new HTTP::Response(RC_OK);
-      $client_res->header(
-        'Content-Type' => 'application/ocsp-response',
-        'Content-Length' => length $cache{'response'},
-        'Date' => strftime("%a, %d %b %Y %T %Z", localtime),
-        'Expires' => strftime("%a, %d %b %Y %T %Z", localtime $cache{'nextupd'}),
-        'Last-Modified' => strftime("%a, %d %b %Y %T %Z", localtime $cache{'thisupd'})
-      );
-      $client_res->content($cache{'response'});
-      $c->send_response($client_res);
-    }
-
-    debug("disconnecting %s:%d", $c->peerhost, $c->peerport);
-    $c->close;
-    undef $c
+  while (my $con = $daemon->accept) {
+    threads->create(\&process_req, $con)->detach();
   }
 }
+
+sub process_req {
+  my $c = shift;
+
+  my $asn_top = $asn->find("OCSPRequest");
+  bailout("asn1 cannot find top of structure: %s", $asn->error()) unless $asn_top;
+
+  info("connection from %s:%d", $c->peerhost, $c->peerport);
+  REQ: while (my $r = $c->get_request) {
+
+    if ($r->header('X-Forwarded-For')) {
+      info("forward for: %s", $r->header('X-Forwarded-For'));
+    }
+
+    unless ($r->method eq 'POST') {
+      warning("method is not POST");
+      $c->send_error(RC_FORBIDDEN);
+      next
+    }
+
+    unless ($r->header('Host') || $r->header('X-prune-from-cache')) {
+      warning("no 'Host' header found");
+      $c->send_error(RC_BAD_REQUEST);
+      next
+    }
+
+    unless ($r->header('Content-Type') eq "application/ocsp-request") {
+      warning("Content-Type is not 'application/ocsp-request'");
+      $c->send_error(RC_BAD_REQUEST);
+      next
+    }
+
+    my $ocsp_req = $asn_top->decode($r->content);
+
+    unless ($ocsp_req) {
+      warning("cannot parse ocsp request");
+      $c->send_error(RC_BAD_REQUEST);
+      next
+    }
+
+    if (scalar @{$ocsp_req->{'tbsRequest'}->{'requestList'}} > 1) {
+      warning("multiple requests detected -> pass through");
+      my $ua = new LWP::UserAgent('agent' => "ocsp_proxy");
+      my $proxy_req = new HTTP::Request('POST' => "http://".$r->header('Host'));
+      $proxy_req->header(%{$r->headers});
+      $proxy_req->content($r->content);
+      debug("forwarding ocsp request to %s", $r->header('Host'));
+      my $proxy_res = $ua->request($proxy_req);
+      my $client_res = new HTTP::Response($proxy_res->code);
+      $client_res->header(%{$proxy_res->headers});
+      $client_res->content($proxy_res->content);
+      $c->send_response($client_res);
+      next
+    }
+
+    my $issuer_key_hash = unpack("H*", $ocsp_req->{'tbsRequest'}->{'requestList'}->[0]->{'reqCert'}->{'issuerKeyHash'});
+    my $cert_serial = Math::BigInt->new($ocsp_req->{'tbsRequest'}->{'requestList'}->[0]->{'reqCert'}->{'serialNumber'})->as_hex;
+    $cert_serial =~ s/^0x//;
+
+    my $cache_key = $config->{'rprefix'} . $issuer_key_hash . '_' . $cert_serial;
+    debug("cache key is %s", $cache_key);
+
+    my %cache;
+    eval { %cache = $redis->hgetall($cache_key) };
+    bailout("redis connection failed: %s", $@) if $@;
+
+    if ($r->header('X-prune-from-cache')) {
+      info("removing %s from cache", $cache_key);
+      $cache{'delete'} = 1;
+      $redisQueue->enqueue(\%cache);
+      $c->send_error(RC_GONE);
+      next
+    }
+
+    unless (%cache && ($cache{'nextupd'} or 0) > time && \
+      ($cache{'thisupd'} or 0) > 0 && $cache{'request'} && $cache{'response'}) {
+      debug("cache needs update");
+      %cache = ('cache_key' => $cache_key, 'ocsp_responder' => $r->header('Host'), 'request' => $r->content);
+      if (update_cache(\%cache)) {
+        unless ($cache{'nonce'}) {
+          $redisQueue->enqueue(\%cache);
+        } else {
+          warning("responder answered with a nonce, cannot cache those")
+        }
+      } else {
+        error("cache is invalid and cannot get valid data from ocsp responder");
+        $cache{'delete'} = 1;
+        $redisQueue->enqueue(\%cache);
+        $c->send_error(RC_SERVICE_UNAVAILABLE);
+        next REQ
+      }
+    }
+
+    debug("sending response");
+    my $client_res = new HTTP::Response(RC_OK);
+    $client_res->header(
+      'Content-Type' => 'application/ocsp-response',
+      'Content-Length' => length $cache{'response'},
+      'Date' => strftime("%a, %d %b %Y %T %Z", localtime),
+      'Expires' => strftime("%a, %d %b %Y %T %Z", localtime $cache{'nextupd'}),
+      'Last-Modified' => strftime("%a, %d %b %Y %T %Z", localtime $cache{'thisupd'})
+    );
+    $client_res->content($cache{'response'});
+    $c->send_response($client_res);
+  }
+
+  debug("disconnecting %s:%d", $c->peerhost, $c->peerport);
+  $c->close;
+  undef $c
+}
+
 
 __END__
 
@@ -533,7 +549,7 @@ hourly if the validity period is at half-time.
 
 =head1 AUTHOR
 
-Philippe Kueck <projects at unixadm dot org>
+fork from ocsp_proxy from Philippe Kueck <projects at unixadm dot org>
 
 =head1 LICENSE
 
